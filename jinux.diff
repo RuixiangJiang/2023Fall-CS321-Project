@@ -1,0 +1,335 @@
+diff --git a/framework/jinux-frame/src/arch/x86/boot/boot.S b/framework/jinux-frame/src/arch/x86/boot/boot.S
+index f85abfb..fc8a7c1 100644
+--- a/framework/jinux-frame/src/arch/x86/boot/boot.S
++++ b/framework/jinux-frame/src/arch/x86/boot/boot.S
+@@ -39,9 +39,20 @@ __linux32_boot:
+ .org 0x200
+ .global __linux64_boot_tag
+ __linux64_boot_tag:
+-    lea  rax, [rip + __linux64_boot]  // jump into Rust code
+-    call rax
+-    jmp halt // unreachable here
++    cli
++    cld
++
++    // Set the kernel call stack.
++    mov rsp, offset boot_stack_top
++
++    push rsi    // boot_params ptr
++    push ENTRYTYPE_LINUX_32
++
++    jmp initial_boot_setup
++    // lea  rax, [rip + __linux64_boot]  // jump into Rust code
++    // lgdt [boot_gdtr]
++    // call rax
++    // jmp halt // unreachable here
+ 
+ // The multiboot & multiboot2 entry point.
+ .code32
+@@ -72,16 +83,18 @@ magic_is_mb2:
+     push ENTRYTYPE_MULTIBOOT2
+     jmp initial_boot_setup
+ 
++.code64
+ initial_boot_setup:
+     // Prepare for far return. We use a far return as a fence after setting GDT.
+-    mov eax, 24
+-    push eax
+-    lea edx, [protected_mode]
+-    push edx
++    //mov eax, 24
++    //push eax
++    //lea edx, [protected_mode]
++    //push edx
+ 
+     // Switch to our own temporary GDT.
+     lgdt [boot_gdtr]
+-    retf
++    jmp protected_mode
++    //retf
+ 
+ protected_mode:
+     mov ax, 16
+@@ -91,6 +104,7 @@ protected_mode:
+     mov fs, ax
+     mov gs, ax
+ 
++.code64
+ page_table_setup:
+     // Zero out the page table.
+     mov al, 0x00
+@@ -223,32 +237,33 @@ write_pt_32g_entry:
+ 
+ enable_long_mode:
+     // Enable PAE and PGE.
+-    mov eax, cr4
+-    or  eax, 0xa0
+-    mov cr4, eax
++    mov rax, cr4
++    or  rax, 0xa0
++    mov cr4, rax
+ 
+     // Set the page table address.
+-    lea eax, [boot_pml4]
+-    mov cr3, eax
++    lea rax, [boot_pml4]
++    mov cr3, rax
+ 
+     // Enable long mode.
+-    mov ecx, 0xc0000080
++    mov rcx, 0xc0000080
+     rdmsr
+     or  eax, 0x0100
+     wrmsr
+ 
+     // Prepare for far return.
+-    mov  eax, 8
+-    push eax
+-    lea  edx, [long_mode_in_low_address]
+-    push edx
++    //mov  rax, 8
++    //push rax
++    //lea  rdx, [long_mode_in_low_address]
++    //push rdx
+ 
+     // Enable paging.
+-    mov eax, cr0
++    mov rax, cr0
+     or  eax, 0x80000000
+-    mov cr0, eax
++    mov cr0, rax
+ 
+-    retf
++    jmp long_mode_in_low_address
++    //retf
+ 
+ // Temporary GDTR/GDT entries. This must be located in the .boot section as its
+ // address (gdt) must be physical to load.
+diff --git a/framework/jinux-frame/src/arch/x86/iommu/context_table.rs b/framework/jinux-frame/src/arch/x86/iommu/context_table.rs
+index d985481..d64e8fc 100644
+--- a/framework/jinux-frame/src/arch/x86/iommu/context_table.rs
++++ b/framework/jinux-frame/src/arch/x86/iommu/context_table.rs
+@@ -109,9 +109,10 @@ impl RootTable {
+                 .unwrap();
+             self.context_tables.get_mut(&address).unwrap()
+         } else {
+-            self.context_tables
++            let r = self.context_tables
+                 .get_mut(&(bus_entry.addr() as usize))
+-                .unwrap()
++                .unwrap();
++            r
+         }
+     }
+ 
+diff --git a/framework/jinux-frame/src/arch/x86/linker.ld b/framework/jinux-frame/src/arch/x86/linker.ld
+index c2e6d02..79ad8ea 100644
+--- a/framework/jinux-frame/src/arch/x86/linker.ld
++++ b/framework/jinux-frame/src/arch/x86/linker.ld
+@@ -1,4 +1,4 @@
+-ENTRY(__multiboot_boot)
++ENTRY(__linux64_boot_tag)
+ OUTPUT_ARCH(i386:x86-64)
+ OUTPUT_FORMAT(elf64-x86-64)
+ 
+@@ -71,4 +71,4 @@ SECTIONS
+     . = DATA_SEGMENT_END(.);
+ 
+     __kernel_end = . - KERNEL_VMA;
+-}
+\ No newline at end of file
++}
+diff --git a/framework/jinux-frame/src/arch/x86/qemu.rs b/framework/jinux-frame/src/arch/x86/qemu.rs
+index 5d8fd7b..7b0f289 100644
+--- a/framework/jinux-frame/src/arch/x86/qemu.rs
++++ b/framework/jinux-frame/src/arch/x86/qemu.rs
+@@ -26,5 +26,6 @@ pub fn exit_qemu(exit_code: QemuExitCode) -> ! {
+     unsafe {
+         port.write(exit_code as u32);
+     }
++    loop {}
+     unreachable!()
+ }
+diff --git a/framework/jinux-frame/src/arch/x86/timer/apic.rs b/framework/jinux-frame/src/arch/x86/timer/apic.rs
+index e68c84f..08d04ad 100644
+--- a/framework/jinux-frame/src/arch/x86/timer/apic.rs
++++ b/framework/jinux-frame/src/arch/x86/timer/apic.rs
+@@ -67,7 +67,7 @@ fn periodic_mode_init() {
+     irq.on_active(init_function);
+     let mut io_apic = IO_APIC.get().unwrap().get(0).unwrap().lock();
+     debug_assert_eq!(io_apic.interrupt_base(), 0);
+-    io_apic.enable(2, irq.clone()).unwrap();
++    io_apic.enable(0, irq.clone()).unwrap();
+     drop(io_apic);
+     // divide by 64
+     apic_lock.set_timer_div_config(DivideConfig::Divide64);
+@@ -97,7 +97,7 @@ fn periodic_mode_init() {
+             }
+         }
+         let mut io_apic = IO_APIC.get().unwrap().get(0).unwrap().lock();
+-        io_apic.disable(2).unwrap();
++        io_apic.disable(0).unwrap();
+         drop(io_apic);
+         // stop APIC Timer, get the number of tick we need
+         let mut apic_lock = APIC_INSTANCE.get().unwrap().lock();
+diff --git a/framework/jinux-frame/src/arch/x86/timer/mod.rs b/framework/jinux-frame/src/arch/x86/timer/mod.rs
+index aee24d1..3aa1cec 100644
+--- a/framework/jinux-frame/src/arch/x86/timer/mod.rs
++++ b/framework/jinux-frame/src/arch/x86/timer/mod.rs
+@@ -29,6 +29,7 @@ pub fn init() {
+         let irq = IrqLine::alloc().unwrap();
+         TIMER_IRQ_NUM.store(irq.num(), Ordering::Relaxed);
+         drop(irq);
++        log::debug!("Initializing APIC");
+         apic::init();
+     } else {
+         pit::init();
+diff --git a/framework/jinux-frame/src/arch/x86/timer/pit.rs b/framework/jinux-frame/src/arch/x86/timer/pit.rs
+index bd0d57b..69fce02 100644
+--- a/framework/jinux-frame/src/arch/x86/timer/pit.rs
++++ b/framework/jinux-frame/src/arch/x86/timer/pit.rs
+@@ -8,7 +8,7 @@ const TIMER_RATE: u32 = 1193182;
+ 
+ static TIMER_PERIOD: IoPort<u8, WriteOnlyAccess> = unsafe { IoPort::new(0x40) };
+ static TIMER_MOD: IoPort<u8, WriteOnlyAccess> = unsafe { IoPort::new(0x43) };
+-static TIMER_SQUARE_WAVE: u8 = 0x36;
++static TIMER_SQUARE_WAVE: u8 = 0x34;
+ 
+ pub(crate) fn init() {
+     // Initialize timer.
+diff --git a/framework/jinux-frame/src/bus/mmio/mod.rs b/framework/jinux-frame/src/bus/mmio/mod.rs
+index 252cca2..ca199f2 100644
+--- a/framework/jinux-frame/src/bus/mmio/mod.rs
++++ b/framework/jinux-frame/src/bus/mmio/mod.rs
+@@ -22,7 +22,8 @@ static IRQS: SpinLock<Vec<IrqLine>> = SpinLock::new(Vec::new());
+ 
+ pub fn init() {
+     // FIXME: The address 0xFEB0_0000 is obtained from an instance of microvm, and it may not work in other architecture.
+-    iter_range(0xFEB0_0000..0xFEB0_4000);
++    // iter_range(0xFEB0_0000..0xFEB0_4000);
++    iter_range(0xD000_0000..0xFFFF_F000);
+ }
+ 
+ fn iter_range(range: Range<usize>) {
+@@ -48,6 +49,7 @@ fn iter_range(range: Range<usize>) {
+             if device_id == 0 {
+                 continue;
+             }
++            debug!("Found MMIO device at {current:#x}, id={device_id:#x}");
+             let handle = IrqLine::alloc().unwrap();
+             // If has two IOApic, then start: 24 (0 in IOApic2), end 47 (23 in IOApic2)
+             // If one IOApic, then start: 16, end 23
+diff --git a/framework/jinux-frame/src/bus/pci/bus.rs b/framework/jinux-frame/src/bus/pci/bus.rs
+index b487d8f..c97e444 100644
+--- a/framework/jinux-frame/src/bus/pci/bus.rs
++++ b/framework/jinux-frame/src/bus/pci/bus.rs
+@@ -65,7 +65,7 @@ impl PciBus {
+     }
+ 
+     pub(super) fn register_common_device(&mut self, mut common_device: PciCommonDevice) {
+-        debug!("Find pci common devices:{:x?}", common_device);
++        // debug!("Find pci common devices:{:x?}", common_device);
+         let device_id = *common_device.device_id();
+         for driver in self.drivers.iter() {
+             common_device = match driver.probe(common_device) {
+diff --git a/services/comps/time/src/lib.rs b/services/comps/time/src/lib.rs
+index bb9c69c..6fad698 100644
+--- a/services/comps/time/src/lib.rs
++++ b/services/comps/time/src/lib.rs
+@@ -26,6 +26,18 @@ pub struct SystemTime {
+ }
+ 
+ impl SystemTime {
++    pub(crate) const fn tmp_default() -> Self {
++        Self {
++            century: 20,
++            year: 2023,
++            month: 12,
++            day: 1,
++            hour: 0,
++            minute: 0,
++            second: 0,
++        }
++    }
++
+     pub(crate) const fn zero() -> Self {
+         Self {
+             century: 0,
+diff --git a/services/comps/time/src/rtc.rs b/services/comps/time/src/rtc.rs
+index 45924da..29a3a09 100644
+--- a/services/comps/time/src/rtc.rs
++++ b/services/comps/time/src/rtc.rs
+@@ -28,6 +28,7 @@ pub fn is_updating() -> bool {
+ }
+ 
+ pub fn read() -> SystemTime {
++    return SystemTime::tmp_default();
+     update_time();
+     *READ_TIME.lock()
+ }
+diff --git a/services/comps/virtio/src/device/network/device.rs b/services/comps/virtio/src/device/network/device.rs
+index 3faecad..6b71e68 100644
+--- a/services/comps/virtio/src/device/network/device.rs
++++ b/services/comps/virtio/src/device/network/device.rs
+@@ -34,7 +34,7 @@ impl NetworkDevice {
+         let device_features = NetworkFeatures::from_bits_truncate(device_features);
+         let supported_features = NetworkFeatures::support_features();
+         let network_features = device_features & supported_features;
+-        debug!("{:?}", network_features);
++        debug!("features: {:?}", network_features);
+         network_features.bits()
+     }
+ 
+diff --git a/services/comps/virtio/src/lib.rs b/services/comps/virtio/src/lib.rs
+index aee89fc..0716e61 100644
+--- a/services/comps/virtio/src/lib.rs
++++ b/services/comps/virtio/src/lib.rs
+@@ -32,6 +32,10 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
+         // Reset device
+         transport.set_device_status(DeviceStatus::empty()).unwrap();
+         // Set to acknowledge
++        // firecracker/src/vmm/src/devices/virtio/mmio.rs:173
++        transport
++            .set_device_status(DeviceStatus::ACKNOWLEDGE)
++            .unwrap();
+         transport
+             .set_device_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER)
+             .unwrap();
+diff --git a/services/libs/jinux-std/src/console.rs b/services/libs/jinux-std/src/console.rs
+index b64572d..0308613 100644
+--- a/services/libs/jinux-std/src/console.rs
++++ b/services/libs/jinux-std/src/console.rs
+@@ -17,7 +17,8 @@ impl Write for VirtioConsolesPrinter {
+ }
+ 
+ pub fn _print(args: Arguments) {
+-    VirtioConsolesPrinter.write_fmt(args).unwrap();
++    jinux_frame::arch::console::print(args);
++    // VirtioConsolesPrinter.write_fmt(args).unwrap();
+ }
+ 
+ /// Copy from Rust std: https://github.com/rust-lang/rust/blob/master/library/std/src/macros.rs
+diff --git a/services/libs/jinux-std/src/device/tty/driver.rs b/services/libs/jinux-std/src/device/tty/driver.rs
+index b78036f..6ff1c27 100644
+--- a/services/libs/jinux-std/src/device/tty/driver.rs
++++ b/services/libs/jinux-std/src/device/tty/driver.rs
+@@ -12,6 +12,7 @@ pub(super) fn init() {
+     for (_, device) in jinux_console::all_devices() {
+         device.register_callback(&console_input_callback)
+     }
++    register_console_input_callback(&serial_input_callback);
+     let tty_driver = Arc::new(TtyDriver::new());
+     // FIXME: install n_tty into tty_driver?
+     let n_tty = get_n_tty();
+diff --git a/services/libs/jinux-std/src/time/system_time.rs b/services/libs/jinux-std/src/time/system_time.rs
+index b885aec..6b747e9 100644
+--- a/services/libs/jinux-std/src/time/system_time.rs
++++ b/services/libs/jinux-std/src/time/system_time.rs
+@@ -26,6 +26,7 @@ impl SystemTime {
+     /// Returns the current system time
+     pub fn now() -> Self {
+         let system_time = jinux_time::get_real_time();
++        log::debug!("system_time = {system_time:?}");
+         // The get real time result should always be valid
+         convert_system_time(system_time).unwrap()
+     }
